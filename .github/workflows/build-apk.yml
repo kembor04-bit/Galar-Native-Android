@@ -1,0 +1,92 @@
+name: Build GalarNative APK (optimized)
+
+# Run it by hand: Actions tab > "Build GalarNative APK (optimized)" > Run workflow.
+# It applies the change below to the engine, builds the whole app with the project's own script
+# (scripts/build_apk_pc.sh) and leaves GalarNative.apk as a downloadable file at the bottom of the run page.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply the optimization patch
+        run: |
+          cat > /tmp/opt.patch <<'PATCH_END'
+          diff --git a/dm/android/app/jni/android_main.c b/dm/android/app/jni/android_main.c
+          index 8946d6e..c3832ef 100644
+          --- a/dm/android/app/jni/android_main.c
+          +++ b/dm/android/app/jni/android_main.c
+          @@ -835,12 +835,29 @@ static void host_start(void) {
+           // (log_mirror): a hot phone can cap its prime cores below the others (1.69 GHz seen against 2.9), and then the threads move. A phone whose cores are all alike is left alone.
+           // DM_CPU_PIN=off leaves the scheduler to it
+           static pid_t g_pin_tid[2]; static int g_pin_n; static long g_pin_top;
+          +static pid_t g_wk_tid[8]; static int g_wk_n;   // the game's frame workers (JobThread1 / 2), kept off the slowest cores below
+          +int dm_ab(const char *key);
+           static void pin_update(void) {
+               const char *e = getenv("DM_CPU_PIN"); if ((e && !strcmp(e, "off")) || !g_pin_n) return;
+               long top = 0, low = 0, f[32]; cpu_set_t set; CPU_ZERO(&set); int n = 0;
+               for (int c = 0; c < 32; c++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", c); FILE *fp = fopen(p, "r"); f[c] = 0;
+                   if (fp) { if (fscanf(fp, "%ld", &f[c]) != 1) f[c] = 0; fclose(fp); } if (f[c] > top) top = f[c]; if (f[c] && (!low || f[c] < low)) low = f[c]; }
+               if (!top) return;
+          +    // The frame workers (JobThread1 / 2) are not pinned to the top cores like the two threads above, but they are kept off the slowest cores: on a phone with three kinds of
+          +    //   core (Snapdragon 8s Gen 3: 1 x 3.0 GHz, 4 x 2.8, 3 x 2.0 GHz) a worker that lands on a 2.0 GHz core makes the frame wait for it. Allowed: every core whose limit is
+          +    //   at least 75 % of the fastest. A phone whose cores are all alike, or whose slow cores are not that slow, is left as it was. DM_CPU_PIN_WORKERS=0 turns it off;
+          +    //   DM_AB=<frames>:wpin compares the two in one run (the timing lines name the side)
+          +    if (g_wk_n) {
+          +        static cpu_set_t wlast; static int wset; const char *we = getenv("DM_CPU_PIN_WORKERS");
+          +        int ab = dm_ab("wpin"), on = ab >= 0 ? ab : !(we && !strcmp(we, "0"));
+          +        cpu_set_t ws; CPU_ZERO(&ws); int wn = 0;
+          +        for (int c = 0; c < 32; c++) if (f[c] && (!on || top == low || f[c] * 4 >= top * 3)) { CPU_SET(c, &ws); wn++; }
+          +        if (wn && (!wset || !CPU_EQUAL(&wlast, &ws))) {
+          +            wlast = ws; wset = 1;
+          +            for (int i = 0; i < g_wk_n; i++) sched_setaffinity(g_wk_tid[i], sizeof ws, &ws);
+          +            fprintf(stderr, "[cpu] frame workers (%d): %s, %d cores allowed\n", g_wk_n, on ? "kept off the slowest cores" : "any core", wn);
+          +        }
+          +    }
+               if (top == low) { if (!g_pin_top) return; for (int c = 0; c < 32; c++) if (f[c]) { CPU_SET(c, &set); n++; } }   // all alike now: every core
+               else for (int c = 0; c < 32; c++) if (f[c] == top) { CPU_SET(c, &set); n++; }
+               // never fewer cores than pinned threads: a hot Galaxy Z Flip5 capped its prime core to 1.71 GHz with the middle ones at 1.56, and both threads a frame waits on
+          @@ -908,7 +925,9 @@ void front_frame_work(uint64_t busy_ns, uint64_t period_ns) {
+                   g_hint = m && p_hint_create ? p_hint_create(m, t, n, (int64_t)target_ns) : NULL;
+                   if (!g_hint && n > pinned && m && p_hint_create) g_hint = p_hint_create(m, t, n = pinned, (int64_t)target_ns);   // (refused with the workers: the two threads as before)
+                   if (!g_hint || !p_hint_report) { g_hint_failed = 1; fprintf(stderr, "[cpu] no performance hint session\n"); return; }
+          -        g_hint_target = (int64_t)target_ns; for (size_t i = 0; i < pinned; i++) g_pin_tid[i] = t[i]; g_pin_n = (int)pinned; pin_update();
+          +        g_hint_target = (int64_t)target_ns; for (size_t i = 0; i < pinned; i++) g_pin_tid[i] = t[i]; g_pin_n = (int)pinned;
+          +        for (size_t i = pinned; i < n && g_wk_n < 8; i++) g_wk_tid[g_wk_n++] = t[i];   // (the workers the session took, if it took any)
+          +        pin_update();
+                   fprintf(stderr, "[cpu] performance hint session: %zu threads (%zu of them the game's frame workers), target %.1f ms of the %.1f ms frame; presenting thread at priority -10\n", n, n - pinned, target_ns / 1e6, period_ns / 1e6);
+               }
+               if ((int64_t)target_ns != g_hint_target && p_hint_target) p_hint_target(g_hint, g_hint_target = (int64_t)target_ns);
+          PATCH_END
+          patch -p1 --fuzz=2 < /tmp/opt.patch
+          git --no-pager diff --stat
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl python3-venv build-essential cmake ninja-build
+
+      - name: Restore the signing key (keeps updates installable over each other)
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/psa-build/debug.keystore
+          key: galar-signing-key-v1
+
+      - name: Build the app
+        run: bash scripts/build_apk_pc.sh
+
+      - name: Keep the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GalarNative-apk
+          path: /home/runner/psa-build/GalarNative.apk
+          retention-days: 30
